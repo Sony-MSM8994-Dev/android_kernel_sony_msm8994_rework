@@ -378,7 +378,7 @@ el0_sync:
 	cmp	x24, #ESR_EL1_EC_FP_EXC64	// FP/ASIMD exception
 	b.eq	el0_fpsimd_exc
 	cmp	x24, #ESR_EL1_EC_SYS64		// configurable trap
-	b.eq	el0_undef
+	b.eq	el0_sys
 	cmp	x24, #ESR_EL1_EC_SP_ALIGN	// stack alignment exception
 	b.eq	el0_sp_pc
 	cmp	x24, #ESR_EL1_EC_PC_ALIGN	// pc alignment exception
@@ -491,6 +491,15 @@ el0_undef:
 	enable_dbg_and_irq
 	mov	x0, sp
 	b	do_undefinstr
+el0_sys:
+	/*
+	 * System instructions, for trapped cache maintenance instructions
+	 */
+	enable_dbg
+	enable_irq
+	mov	x0, x25
+	mov	x1, sp
+	b	do_sysinstr
 el0_dbg:
 	/*
 	 * Debug exception handling
@@ -563,11 +572,16 @@ ENDPROC(cpu_switch_to)
  */
 ret_fast_syscall:
 	disable_irq				// disable interrupts
-	ldr	x1, [tsk, #TI_FLAGS]
+	ldr	x1, [tsk, #TI_FLAGS]		// re-check for syscall tracing
+	and	x2, x1, #_TIF_SYSCALL_WORK
+	cbnz	x2, ret_fast_syscall_trace
 	and	x2, x1, #_TIF_WORK_MASK
 	cbnz	x2, fast_work_pending
 	enable_step_tsk x1, x2
 	kernel_exit 0, ret = 1
+ret_fast_syscall_trace:
+	enable_irq				// enable interrupts
+	b	__sys_trace_return
 
 /*
  * Ok, we need to do extra processing, enter the slow path.
@@ -642,12 +656,15 @@ ENDPROC(el0_svc)
 	 * switches, and waiting for our parent to respond.
 	 */
 __sys_trace:
-	mov	x0, sp
+	mov	w0, #-1				// set default errno for
+	cmp     scno, x0			// user-issued syscall(-1)
+	b.ne	1f
+	mov	x0, #-ENOSYS
+	str	x0, [sp, #S_X0]
+1:	mov	x0, sp
 	bl	syscall_trace_enter
 	adr	lr, __sys_trace_return		// return address
-	cmp	w0, #RET_SKIP_SYSCALL_TRACE	// skip syscall and tracing?
-	b.eq	ret_to_user
-	cmp	w0, #RET_SKIP_SYSCALL		// skip syscall?
+	cmp	w0, #-1				// skip the syscall?
 	b.eq	__sys_trace_return_skipped
 	uxtw	scno, w0			// syscall number (possibly new)
 	mov	x1, sp				// pointer to regs
@@ -661,8 +678,8 @@ __sys_trace:
 	br	x16				// call sys_* routine
 
 __sys_trace_return:
-	str	x0, [sp]			// save returned x0
-__sys_trace_return_skipped:			// x0 already in regs[0]
+	str	x0, [sp, #S_X0]			// save returned x0
+__sys_trace_return_skipped:
 	mov	x0, sp
 	bl	syscall_trace_exit
 	b	ret_to_user

@@ -57,13 +57,14 @@ obj-$(CONFIG_MWIFIEX)	+= mwifiex/
 
 obj-$(CONFIG_SOMC_WIFI_CONTROL)	+= somcwifictrl/
 
-obj-$(CONFIG_BCMDHD)	+= bcmdhd/
-obj-$(CONFIG_BCMDHD_SUZURAN)	+= bcmdhd_suzuran/
+obj-$(CONFIG_BCMDHD_BCM43455)	+= bcmdhd_bcm43455/
+obj-$(CONFIG_BCMDHD_BCM4356)	+= bcmdhd_bcm4356/
+
 obj-$(CONFIG_BRCMFMAC)	+= brcm80211/
 obj-$(CONFIG_BRCMSMAC)	+= brcm80211/
 
 obj-$(CONFIG_LIBRA_SDIOIF)	+= libra/
 obj-$(CONFIG_WCNSS_CORE)	+= wcnss/
-obj-$(CONFIG_CNSS_SDIO)		+= cnss/cnss_sdio.o
 obj-$(CONFIG_CNSS)		+= cnss/
 obj-$(CONFIG_WCNSS_MEM_PRE_ALLOC) += cnss_prealloc/
+obj-$(CONFIG_CNSS_CRYPTO)	+= cnss_crypto/

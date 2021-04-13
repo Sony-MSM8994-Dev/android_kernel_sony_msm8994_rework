@@ -1041,7 +1041,8 @@ void somc_chg_aicl_set_keep_state(bool state)
 {
 	chg_params->aicl_keep_state = state;
 	if (state)
-		schedule_delayed_work(&chg_params->power_supply_changed_work,
+		queue_delayed_work(system_power_efficient_wq,
+			&chg_params->power_supply_changed_work,
 			msecs_to_jiffies(BATT_STATUS_UPDATE_MS));
 }
 
@@ -1333,7 +1334,7 @@ static void somc_chg_aicl_reset_params(void)
 }
 
 #define AICL_PERIOD_MS			200
-#define AICL_WAKE_PERIOD		(10 * HZ)
+#define AICL_WAKE_PERIOD		(10000)
 static void somc_chg_aicl_work(struct work_struct *work)
 {
 	if (!*chg_params->usb_present)
@@ -1353,7 +1354,8 @@ static void somc_chg_aicl_work(struct work_struct *work)
 			*chg_params->usb_suspended,
 			chg_params->last_therm_lvl_sel,
 			*chg_params->thermal.lvl_sel);
-		wake_lock_timeout(&chg_params->aicl_wakelock, AICL_WAKE_PERIOD);
+		wake_lock_timeout(&chg_params->aicl_wakelock,
+							msecs_to_jiffies(AICL_WAKE_PERIOD));
 		somc_chg_aicl_reset_params();
 		somc_chg_set_thermal_limited_iusb_max(IUSBMAX_MIN_0MA);
 		chg_params->last_usb_target_current_ma =
@@ -1374,7 +1376,8 @@ static void somc_chg_aicl_work(struct work_struct *work)
 
 	somc_chg_weak_detect_weak_charger();
 
-	schedule_delayed_work(&chg_params->aicl_work,
+	queue_delayed_work(system_power_efficient_wq,
+			&chg_params->aicl_work,
 			msecs_to_jiffies(AICL_PERIOD_MS));
 
 	return;
@@ -1409,10 +1412,11 @@ void somc_chg_aicl_start_work(void)
 		*chg_params->usb_present) {
 			pr_info("Start aicl worker\n");
 			wake_lock_timeout(&chg_params->aicl_wakelock,
-							AICL_WAKE_PERIOD);
+							msecs_to_jiffies(AICL_WAKE_PERIOD));
 			somc_chg_set_thermal_limited_iusb_max(IUSBMAX_MIN_0MA);
 			somc_chg_forced_iusb_dec_clear_params();
-			schedule_delayed_work(&chg_params->aicl_work,
+			queue_delayed_work(system_power_efficient_wq,
+				&chg_params->aicl_work,
 				msecs_to_jiffies(AICL_PERIOD_MS));
 	}
 }
@@ -1434,7 +1438,8 @@ static void somc_chg_weak_set_state(bool state)
 		if (state)
 			pr_info("Detect weak charger. AICL current %d mA\n",
 				*chg_params->usb_max_current_ma);
-		schedule_delayed_work(&chg_params->power_supply_changed_work,
+		queue_delayed_work(system_power_efficient_wq,
+			&chg_params->power_supply_changed_work,
 			msecs_to_jiffies(SWITCH_STATE_UPDATE_MS));
 	}
 }
@@ -1976,7 +1981,8 @@ void somc_chg_voltage_check_start(struct chg_somc_params *params)
 
 	params->vol_check.is_running = true;
 	pr_info("voltage check start\n");
-	schedule_delayed_work(&params->vol_check.work,
+	queue_delayed_work(system_power_efficient_wq,
+				&params->vol_check.work,
 				msecs_to_jiffies(VOLTAGE_CHECK_DELAY_MS));
 
 out:
@@ -2008,7 +2014,8 @@ static void somc_chg_voltage_check_work(struct work_struct *work)
 				params->vol_check.usb_current_limit);
 
 	if (params->vol_check.is_running)
-		schedule_delayed_work(&params->vol_check.work,
+		queue_delayed_work(system_power_efficient_wq,
+				&params->vol_check.work,
 				msecs_to_jiffies(VOLTAGE_CHECK_DELAY_MS));
 	somc_chg_current_change_mutex_unlock(params->dev);
 }
@@ -2085,7 +2092,8 @@ int somc_chg_invalid_set_state(struct chg_somc_params *params, int status)
 	if (params->invalid_state.enabled) {
 		pr_info("%d\n", !!status);
 		switch_set_state(&params->invalid_state.swdev, !!status);
-		schedule_delayed_work(&params->power_supply_changed_work,
+		queue_delayed_work(system_power_efficient_wq,
+			&params->power_supply_changed_work,
 			msecs_to_jiffies(SWITCH_STATE_UPDATE_MS));
 	}
 	params->invalid_state.state = !!status;
@@ -2405,6 +2413,11 @@ static unsigned int *somc_chg_therm_create_tb(struct device *dev,
 
 	if (of_find_property(node, thermal, &thermal_levels)) {
 		thermal_size = thermal_levels / sizeof(int);
+		if (!thermal_levels || !thermal_size) {
+			dev_err(dev, "Invalid thermal parameters\n");
+			*size = -EINVAL;
+			return NULL;
+		}
 		thermal_tb = devm_kzalloc(dev, thermal_levels, GFP_KERNEL);
 		if (thermal_tb == NULL) {
 			dev_err(dev, "thermal mitigation kzalloc() failed.\n");
@@ -2849,10 +2862,11 @@ void somc_batfet_open(struct device *dev, bool open)
 	}
 }
 
-#define UNPLUG_WAKE_PERIOD		(3 * HZ)
+#define UNPLUG_WAKE_PERIOD		(3000)
 void somc_unplug_wakelock(void)
 {
-	wake_lock_timeout(&chg_params->unplug_wakelock, UNPLUG_WAKE_PERIOD);
+	wake_lock_timeout(&chg_params->unplug_wakelock,
+						msecs_to_jiffies(UNPLUG_WAKE_PERIOD));
 }
 
 #define VFLOAT_CMP_CFG_REG		0xF5

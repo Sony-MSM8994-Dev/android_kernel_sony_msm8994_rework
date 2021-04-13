@@ -85,6 +85,7 @@ struct kmem_cache {
 	int inuse;		/* Offset to metadata */
 	int align;		/* Alignment */
 	int reserved;		/* Reserved bytes at the end of slabs */
+	int red_left_pad;	/* Left redzone padding size */
 	const char *name;	/* Name (only for display!) */
 	struct list_head list;	/* List of slab caches */
 #ifdef CONFIG_SYSFS
@@ -94,6 +95,10 @@ struct kmem_cache {
 	struct memcg_cache_params *memcg_params;
 	int max_attr_size; /* for propagation, maximum size of a stored attr */
 #endif
+
+	unsigned long random;
+	unsigned long random_active;
+	unsigned long random_inactive;
 
 #ifdef CONFIG_NUMA
 	/*

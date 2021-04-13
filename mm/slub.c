@@ -33,6 +33,7 @@
 #include <linux/stacktrace.h>
 #include <linux/prefetch.h>
 #include <linux/memcontrol.h>
+#include <linux/random.h>
 
 #include <trace/events/kmem.h>
 
@@ -123,6 +124,14 @@ static inline int kmem_cache_debug(struct kmem_cache *s)
 #endif
 }
 
+static inline void *fixup_red_left(struct kmem_cache *s, void *p)
+{
+	if (kmem_cache_debug(s) && s->flags & SLAB_RED_ZONE)
+		p += s->red_left_pad;
+
+	return p;
+}
+
 /*
  * Issues still to be resolved:
  *
@@ -198,6 +207,8 @@ struct track {
 
 enum track_item { TRACK_ALLOC, TRACK_FREE };
 
+static const bool slub_cookie = true;
+
 #ifdef CONFIG_SYSFS
 static int sysfs_slab_add(struct kmem_cache *);
 static int sysfs_slab_alias(struct kmem_cache *, const char *);
@@ -248,20 +259,28 @@ static inline int check_valid_pointer(struct kmem_cache *s,
 
 static inline void *get_freepointer(struct kmem_cache *s, void *object)
 {
-	return *(void **)(object + s->offset);
+	unsigned long freepointer_addr = (unsigned long)object + s->offset;
+	return (void *)(*(unsigned long *)freepointer_addr ^ s->random ^ freepointer_addr);
 }
 
 static void prefetch_freepointer(const struct kmem_cache *s, void *object)
 {
-	prefetch(object + s->offset);
+	unsigned long freepointer_addr = (unsigned long)object + s->offset;
+	if (object) {
+		void **freepointer_ptr = (void **)(*(unsigned long *)freepointer_addr ^ s->random ^ freepointer_addr);
+		prefetch(freepointer_ptr);
+	}
 }
 
 static inline void *get_freepointer_safe(struct kmem_cache *s, void *object)
 {
+	unsigned long __maybe_unused freepointer_addr;
 	void *p;
 
 #ifdef CONFIG_DEBUG_PAGEALLOC
-	probe_kernel_read(&p, (void **)(object + s->offset), sizeof(p));
+	freepointer_addr = (unsigned long)object + s->offset;
+	probe_kernel_read(&p, (void **)freepointer_addr, sizeof(p));
+	return (void *)((unsigned long)p ^ s->random ^ freepointer_addr);
 #else
 	p = get_freepointer(s, object);
 #endif
@@ -270,13 +289,50 @@ static inline void *get_freepointer_safe(struct kmem_cache *s, void *object)
 
 static inline void set_freepointer(struct kmem_cache *s, void *object, void *fp)
 {
-	*(void **)(object + s->offset) = fp;
+	unsigned long freepointer_addr = (unsigned long)object + s->offset;
+	*(void **)freepointer_addr = (void *)((unsigned long)fp ^ s->random ^ freepointer_addr);
+}
+
+#ifdef CONFIG_64BIT
+static const unsigned long canary_mask = ~0xFFUL;
+#else
+static const unsigned long canary_mask = ~0UL;
+#endif
+
+static inline unsigned long *get_cookie(struct kmem_cache *s, void *object)
+{
+	if (s->offset)
+		return object + s->offset + sizeof(void *);
+	else
+		return object + s->inuse;
+}
+
+static inline void set_cookie(struct kmem_cache *s, void *object, unsigned long value)
+{
+	if (slub_cookie) {
+		unsigned long *cookie = get_cookie(s, object);
+		*cookie = (value ^ (unsigned long)cookie) & canary_mask;
+	}
+}
+
+static inline void check_cookie(struct kmem_cache *s, void *object, unsigned long value)
+{
+	if (slub_cookie) {
+		unsigned long *cookie = get_cookie(s, object);
+		BUG_ON(*cookie != ((value ^ (unsigned long)cookie) & canary_mask));
+	}
 }
 
 /* Loop over all objects in a slab */
 #define for_each_object(__p, __s, __addr, __objects) \
-	for (__p = (__addr); __p < (__addr) + (__objects) * (__s)->size;\
-			__p += (__s)->size)
+	for (__p = fixup_red_left(__s, __addr); \
+		__p < (__addr) + (__objects) * (__s)->size; \
+		__p += (__s)->size)
+
+#define for_each_object_idx(__p, __idx, __s, __addr, __objects) \
+	for (__p = fixup_red_left(__s, __addr), __idx = 1; \
+		__idx <= __objects; \
+		__p += (__s)->size, __idx++)
 
 /* Determine object index from a given position */
 static inline int slab_index(void *p, struct kmem_cache *s, void *addr)
@@ -300,7 +356,7 @@ static inline size_t slab_ksize(const struct kmem_cache *s)
 	 * back there or track user information then we can
 	 * only use the space before that information.
 	 */
-	if (s->flags & (SLAB_DESTROY_BY_RCU | SLAB_STORE_USER))
+	if ((s->flags & (SLAB_DESTROY_BY_RCU | SLAB_STORE_USER)) || slub_cookie)
 		return s->inuse;
 	/*
 	 * Else we can use all the padding etc for the allocation
@@ -439,6 +495,22 @@ static void get_map(struct kmem_cache *s, struct page *page, unsigned long *map)
 		set_bit(slab_index(p, s, addr), map);
 }
 
+static inline int size_from_object(struct kmem_cache *s)
+{
+	if (s->flags & SLAB_RED_ZONE)
+		return s->size - s->red_left_pad;
+
+	return s->size;
+}
+
+static inline void *restore_red_left(struct kmem_cache *s, void *p)
+{
+	if (s->flags & SLAB_RED_ZONE)
+		p -= s->red_left_pad;
+
+	return p;
+}
+
 /*
  * Debug settings:
  */
@@ -466,9 +538,9 @@ static struct track *get_track(struct kmem_cache *s, void *object,
 	struct track *p;
 
 	if (s->offset)
-		p = object + s->offset + sizeof(void *);
+		p = object + s->offset + sizeof(void *) + sizeof(void *) * slub_cookie;
 	else
-		p = object + s->inuse;
+		p = object + s->inuse + sizeof(void *) * slub_cookie;
 
 	return p + alloc;
 }
@@ -589,7 +661,9 @@ static void print_trailer(struct kmem_cache *s, struct page *page, u8 *p)
 	printk(KERN_ERR "INFO: Object 0x%p @offset=%tu fp=0x%p\n\n",
 			p, p - addr, get_freepointer(s, p));
 
-	if (p > addr + 16)
+	if (s->flags & SLAB_RED_ZONE)
+		print_section("Redzone ", p - s->red_left_pad, s->red_left_pad);
+	else if (p > addr + 16)
 		print_section("Bytes b4 ", p - 16, 16);
 
 	print_section("Object ", p, min_t(unsigned long, s->object_size,
@@ -602,6 +676,9 @@ static void print_trailer(struct kmem_cache *s, struct page *page, u8 *p)
 		off = s->offset + sizeof(void *);
 	else
 		off = s->inuse;
+
+	if (slub_cookie)
+		off += sizeof(void *);
 
 	if (s->flags & SLAB_STORE_USER)
 		off += 2 * sizeof(struct track);
@@ -647,6 +724,9 @@ static void slab_err(struct kmem_cache *s, struct page *page, const char *fmt, .
 static void init_object(struct kmem_cache *s, void *object, u8 val)
 {
 	u8 *p = object;
+
+	if (s->flags & SLAB_RED_ZONE)
+		memset(p - s->red_left_pad, val, s->red_left_pad);
 
 	if (s->flags & __OBJECT_POISON) {
 		memset(p, POISON_FREE, s->object_size - 1);
@@ -735,6 +815,9 @@ static int check_pad_bytes(struct kmem_cache *s, struct page *page, u8 *p)
 		/* Freepointer is placed after the object. */
 		off += sizeof(void *);
 
+	if (slub_cookie)
+		off += sizeof(void *);
+
 	if (s->flags & SLAB_STORE_USER)
 		/* We also have user information there */
 		off += 2 * sizeof(struct track);
@@ -785,6 +868,10 @@ static int check_object(struct kmem_cache *s, struct page *page,
 	u8 *endobject = object + s->object_size;
 
 	if (s->flags & SLAB_RED_ZONE) {
+		if (!check_bytes_and_report(s, page, object, "Redzone",
+			object - s->red_left_pad, val, s->red_left_pad))
+			return 0;
+
 		if (!check_bytes_and_report(s, page, object, "Redzone",
 			endobject, val, s->inuse - s->object_size))
 			return 0;
@@ -1350,6 +1437,7 @@ static void setup_object(struct kmem_cache *s, struct page *page,
 				void *object)
 {
 	setup_object_debug(s, page, object);
+	set_cookie(s, object, s->random_inactive);
 	if (unlikely(s->ctor))
 		s->ctor(object);
 }
@@ -1391,7 +1479,7 @@ static struct page *new_slab(struct kmem_cache *s, gfp_t flags, int node)
 	setup_object(s, page, last);
 	set_freepointer(s, last, NULL);
 
-	page->freelist = start;
+	page->freelist = fixup_red_left(s, start);
 	page->inuse = page->objects;
 	page->frozen = 1;
 out:
@@ -2402,10 +2490,20 @@ redo:
 		stat(s, ALLOC_FASTPATH);
 	}
 
+	if (!(s->flags & (SLAB_DESTROY_BY_RCU | SLAB_POISON)) && !s->ctor && object) {
+		size_t offset = s->offset ? 0 : sizeof(void *);
+		BUG_ON(memchr_inv((void *)object + offset, 0, s->object_size - offset));
+	}
+
 	if (unlikely(gfpflags & __GFP_ZERO) && object)
 		memset(object, 0, s->object_size);
 
 	slab_post_alloc_hook(s, gfpflags, object);
+
+	if (object) {
+		check_cookie(s, object, s->random_inactive);
+		set_cookie(s, object, s->random_active);
+	}
 
 	return object;
 }
@@ -2608,6 +2706,16 @@ static __always_inline void slab_free(struct kmem_cache *s,
 
 	slab_free_hook(s, x);
 
+	check_cookie(s, object, s->random_active);
+	set_cookie(s, object, s->random_inactive);
+
+	if (!(s->flags & (SLAB_DESTROY_BY_RCU | SLAB_POISON))) {
+		size_t offset = s->offset ? 0 : sizeof(void *);
+		memset(x + offset, 0, s->object_size - offset);
+		if (s->ctor)
+			s->ctor(x);
+	}
+
 redo:
 	/*
 	 * Determine the currently cpus per cpu slab.
@@ -2675,7 +2783,7 @@ static int slub_min_objects;
  * Merge control. If this is set then no merging of slab caches will occur.
  * (Could be removed. This was introduced to pacify the merge skeptics.)
  */
-static int slub_nomerge;
+static int slub_nomerge = 1;
 
 /*
  * Calculate the order of allocation given an slab object size.
@@ -2852,6 +2960,7 @@ static void early_kmem_cache_node_alloc(int node)
 	init_object(kmem_cache_node, n, SLUB_RED_ACTIVE);
 	init_tracking(kmem_cache_node, n);
 #endif
+	set_cookie(kmem_cache_node, n, kmem_cache_node->random_active);
 	init_kmem_cache_node(n);
 	inc_slabs_node(kmem_cache_node, node, page->objects);
 
@@ -2965,6 +3074,9 @@ static int calculate_sizes(struct kmem_cache *s, int forced_order)
 		size += sizeof(void *);
 	}
 
+	if (slub_cookie)
+		size += sizeof(void *);
+
 #ifdef CONFIG_SLUB_DEBUG
 	if (flags & SLAB_STORE_USER)
 		/*
@@ -2973,7 +3085,7 @@ static int calculate_sizes(struct kmem_cache *s, int forced_order)
 		 */
 		size += 2 * sizeof(struct track);
 
-	if (flags & SLAB_RED_ZONE)
+	if (flags & SLAB_RED_ZONE) {
 		/*
 		 * Add some empty padding so that we can catch
 		 * overwrites from earlier objects rather than let
@@ -2982,6 +3094,11 @@ static int calculate_sizes(struct kmem_cache *s, int forced_order)
 		 * of the object.
 		 */
 		size += sizeof(void *);
+
+		s->red_left_pad = sizeof(void *);
+		s->red_left_pad = ALIGN(s->red_left_pad, s->align);
+		size += s->red_left_pad;
+	}
 #endif
 
 	/*
@@ -3297,6 +3414,46 @@ void *__kmalloc_node(size_t size, gfp_t flags, int node)
 EXPORT_SYMBOL(__kmalloc_node);
 #endif
 
+#ifdef CONFIG_HARDENED_USERCOPY
+/*
+ * Rejects objects that are incorrectly sized.
+ *
+ * Returns NULL if check passes, otherwise const char * to name of cache
+ * to indicate an error.
+ */
+const char *__check_heap_object(const void *ptr, unsigned long n,
+				struct page *page)
+{
+	struct kmem_cache *s;
+	unsigned long offset;
+	size_t object_size;
+
+	/* Find object and usable object size. */
+	s = page->slab_cache;
+	object_size = slab_ksize(s);
+
+	/* Reject impossible pointers. */
+	if (ptr < page_address(page))
+		return s->name;
+
+	/* Find offset within object. */
+	offset = (ptr - page_address(page)) % s->size;
+
+	/* Adjust for redzone and reject if within the redzone. */
+	if (kmem_cache_debug(s) && s->flags & SLAB_RED_ZONE) {
+		if (offset < s->red_left_pad)
+			return s->name;
+		offset -= s->red_left_pad;
+	}
+
+	/* Allow address range falling entirely within object size. */
+	if (offset <= object_size && n <= object_size - offset)
+		return NULL;
+
+	return s->name;
+}
+#endif /* CONFIG_HARDENED_USERCOPY */
+
 size_t ksize(const void *object)
 {
 	struct page *page;
@@ -3307,7 +3464,7 @@ size_t ksize(const void *object)
 	page = virt_to_head_page(object);
 
 	if (unlikely(!PageSlab(page))) {
-		WARN_ON(!PageCompound(page));
+		BUG_ON(!PageCompound(page));
 		return PAGE_SIZE << compound_order(page);
 	}
 
@@ -3372,11 +3529,12 @@ void kfree(const void *x)
 }
 EXPORT_SYMBOL(kfree);
 
+#define SHRINK_PROMOTE_MAX 32
+
 /*
- * kmem_cache_shrink removes empty slabs from the partial lists and sorts
- * the remaining slabs by the number of items in use. The slabs with the
- * most items in use come first. New allocations will then fill those up
- * and thus they can be removed from the partial lists.
+ * kmem_cache_shrink discards empty slabs and promotes the slabs filled
+ * up most to the head of the partial lists. New allocations will then
+ * fill those up and thus they can be removed from the partial lists.
  *
  * The slabs with the least items are placed last. This results in them
  * being allocated from last increasing the chance that the last objects
@@ -3389,13 +3547,10 @@ int kmem_cache_shrink(struct kmem_cache *s)
 	struct kmem_cache_node *n;
 	struct page *page;
 	struct page *t;
-	int objects = oo_objects(s->max);
-	struct list_head *slabs_by_inuse =
-		kmalloc(sizeof(struct list_head) * objects, GFP_KERNEL);
+	struct list_head discard;
+	struct list_head promote[SHRINK_PROMOTE_MAX];
 	unsigned long flags;
-
-	if (!slabs_by_inuse)
-		return -ENOMEM;
+	int ret = 0;
 
 	flush_all(s);
 	for_each_node_state(node, N_NORMAL_MEMORY) {
@@ -3404,39 +3559,52 @@ int kmem_cache_shrink(struct kmem_cache *s)
 		if (!n->nr_partial)
 			continue;
 
-		for (i = 0; i < objects; i++)
-			INIT_LIST_HEAD(slabs_by_inuse + i);
+		INIT_LIST_HEAD(&discard);
+		for (i = 0; i < SHRINK_PROMOTE_MAX; i++)
+			INIT_LIST_HEAD(promote + i);
 
 		spin_lock_irqsave(&n->list_lock, flags);
 
 		/*
-		 * Build lists indexed by the items in use in each slab.
+		 * Build lists of slabs to discard or promote.
 		 *
 		 * Note that concurrent frees may occur while we hold the
 		 * list_lock. page->inuse here is the upper limit.
 		 */
 		list_for_each_entry_safe(page, t, &n->partial, lru) {
-			list_move(&page->lru, slabs_by_inuse + page->inuse);
-			if (!page->inuse)
+			int free = page->objects - page->inuse;
+
+			/* Do not reread page->inuse */
+			barrier();
+
+			/* We do not keep full slabs on the list */
+			BUG_ON(free <= 0);
+
+			if (free == page->objects) {
+				list_move(&page->lru, &discard);
 				n->nr_partial--;
+			} else if (free <= SHRINK_PROMOTE_MAX)
+				list_move(&page->lru, promote + free - 1);
 		}
 
 		/*
-		 * Rebuild the partial list with the slabs filled up most
-		 * first and the least used slabs at the end.
+		 * Promote the slabs filled up most to the head of the
+		 * partial list.
 		 */
-		for (i = objects - 1; i > 0; i--)
-			list_splice(slabs_by_inuse + i, n->partial.prev);
+		for (i = SHRINK_PROMOTE_MAX - 1; i >= 0; i--)
+			list_splice(promote + i, &n->partial);
 
 		spin_unlock_irqrestore(&n->list_lock, flags);
 
 		/* Release empty slabs */
-		list_for_each_entry_safe(page, t, slabs_by_inuse, lru)
+		list_for_each_entry_safe(page, t, &discard, lru)
 			discard_slab(s, page);
+
+		if (slabs_node(s, node))
+			ret = 1;
 	}
 
-	kfree(slabs_by_inuse);
-	return 0;
+	return ret;
 }
 EXPORT_SYMBOL(kmem_cache_shrink);
 
@@ -3761,6 +3929,10 @@ int __kmem_cache_create(struct kmem_cache *s, unsigned long flags)
 	if (err)
 		kmem_cache_close(s);
 
+	s->random = get_random_long();
+	s->random_active = get_random_long();
+	s->random_inactive = get_random_long();
+
 	return err;
 }
 
@@ -3769,7 +3941,7 @@ int __kmem_cache_create(struct kmem_cache *s, unsigned long flags)
  * Use the cpu notifier to insure that the cpu slabs are flushed when
  * necessary.
  */
-static int __cpuinit slab_cpuup_callback(struct notifier_block *nfb,
+static int slab_cpuup_callback(struct notifier_block *nfb,
 		unsigned long action, void *hcpu)
 {
 	long cpu = (long)hcpu;
@@ -3795,7 +3967,7 @@ static int __cpuinit slab_cpuup_callback(struct notifier_block *nfb,
 	return NOTIFY_OK;
 }
 
-static struct notifier_block __cpuinitdata slab_notifier = {
+static struct notifier_block slab_notifier = {
 	.notifier_call = slab_cpuup_callback
 };
 
@@ -4159,18 +4331,16 @@ static int list_locations(struct kmem_cache *s, char *buf,
 
 		if (num_online_cpus() > 1 &&
 				!cpumask_empty(to_cpumask(l->cpus)) &&
-				len < PAGE_SIZE - 60) {
-			len += sprintf(buf + len, " cpus=");
-			len += cpulist_scnprintf(buf + len, PAGE_SIZE - len - 50,
-						 to_cpumask(l->cpus));
-		}
+				len < PAGE_SIZE - 60)
+			len += scnprintf(buf + len, PAGE_SIZE - len - 50,
+					 " cpus=%*pbl",
+					 cpumask_pr_args(to_cpumask(l->cpus)));
 
 		if (nr_online_nodes > 1 && !nodes_empty(l->nodes) &&
-				len < PAGE_SIZE - 60) {
-			len += sprintf(buf + len, " nodes=");
-			len += nodelist_scnprintf(buf + len, PAGE_SIZE - len - 50,
-					l->nodes);
-		}
+				len < PAGE_SIZE - 60)
+			len += scnprintf(buf + len, PAGE_SIZE - len - 50,
+					 " nodes=%*pbl",
+					 nodemask_pr_args(&l->nodes));
 
 		len += sprintf(buf + len, "\n");
 	}
@@ -4766,12 +4936,9 @@ static ssize_t shrink_show(struct kmem_cache *s, char *buf)
 static ssize_t shrink_store(struct kmem_cache *s,
 			const char *buf, size_t length)
 {
-	if (buf[0] == '1') {
-		int rc = kmem_cache_shrink(s);
-
-		if (rc)
-			return rc;
-	} else
+	if (buf[0] == '1')
+		kmem_cache_shrink(s);
+	else
 		return -EINVAL;
 	return length;
 }
@@ -5049,6 +5216,7 @@ static void memcg_propagate_slab_attrs(struct kmem_cache *s)
 		char mbuf[64];
 		char *buf;
 		struct slab_attribute *attr = to_slab_attr(slab_attrs[i]);
+		ssize_t len;
 
 		if (!attr || !attr->store || !attr->show)
 			continue;
@@ -5073,8 +5241,9 @@ static void memcg_propagate_slab_attrs(struct kmem_cache *s)
 			buf = buffer;
 		}
 
-		attr->show(s->memcg_params->root_cache, buf);
-		attr->store(s, buf, strlen(buf));
+		len = attr->show(s->memcg_params->root_cache, buf);
+		if (len > 0)
+			attr->store(s, buf, len);
 	}
 
 	if (buffer)

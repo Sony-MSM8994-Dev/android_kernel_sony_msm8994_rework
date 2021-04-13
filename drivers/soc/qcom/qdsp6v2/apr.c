@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2015, 2016, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2010-2015, 2018, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -221,11 +221,11 @@ int apr_wait_for_device_up(int dest_id)
 	if (dest_id == APR_DEST_MODEM)
 		rc = wait_event_interruptible_timeout(modem_wait,
 				    (apr_get_modem_state() == APR_SUBSYS_UP),
-				    (1 * HZ));
+				     msecs_to_jiffies(1000));
 	else if (dest_id == APR_DEST_QDSP6)
 		rc = wait_event_interruptible_timeout(dsp_wait,
 				    (apr_get_q6_state() == APR_SUBSYS_UP),
-				    (1 * HZ));
+				     msecs_to_jiffies(1000));
 	else
 		pr_err("%s: unknown dest_id %d\n", __func__, dest_id);
 	/* returns left time */
@@ -364,6 +364,10 @@ struct apr_svc *apr_register(char *dest, char *svc_name, apr_fn svc_fn,
 			}
 		}
 		pr_debug("%s: modem Up\n", __func__);
+	} else {
+		pr_err("%s: Invalid destination id %d\n", __func__,
+				dest_id);
+		return NULL;
 	}
 
 	if (apr_get_svc(svc_name, domain_id, &client_id, &svc_idx, &svc_id)) {
@@ -404,19 +408,19 @@ struct apr_svc *apr_register(char *dest, char *svc_name, apr_fn svc_fn,
 			mutex_unlock(&svc->m_lock);
 			return NULL;
 		}
-		if (!svc->port_cnt && !svc->svc_cnt)
+		if (!svc->svc_cnt)
 			clnt->svc_cnt++;
 		svc->port_cnt++;
 		svc->port_fn[temp_port] = svc_fn;
 		svc->port_priv[temp_port] = priv;
+		svc->svc_cnt++;
 	} else {
 		if (!svc->fn) {
-			if (!svc->port_cnt && !svc->svc_cnt)
+			if (!svc->svc_cnt)
 				clnt->svc_cnt++;
 			svc->fn = svc_fn;
-			if (svc->port_cnt)
-				svc->svc_cnt++;
 			svc->priv = priv;
+			svc->svc_cnt++;
 		}
 	}
 
@@ -551,7 +555,8 @@ void apr_cb_func(void *buf, int len, void *priv)
 
 	temp_port = ((data.dest_port >> 8) * 8) + (data.dest_port & 0xFF);
 	pr_debug("port = %d t_port = %d\n", data.src_port, temp_port);
-	if (c_svc->port_cnt && c_svc->port_fn[temp_port])
+	if (((temp_port >= 0) && (temp_port < APR_MAX_PORTS))
+		&& (c_svc->port_cnt && c_svc->port_fn[temp_port]))
 		c_svc->port_fn[temp_port](&data,  c_svc->port_priv[temp_port]);
 	else if (c_svc->fn)
 		c_svc->fn(&data, c_svc->priv);
@@ -617,28 +622,28 @@ int apr_deregister(void *handle)
 		return -EINVAL;
 
 	mutex_lock(&svc->m_lock);
+	if (!svc->svc_cnt) {
+		pr_err("%s: svc already deregistered. svc = %pK\n",
+			__func__, svc);
+		mutex_unlock(&svc->m_lock);
+		return -EINVAL;
+	}
+
 	dest_id = svc->dest_id;
 	client_id = svc->client_id;
 	clnt = &client[dest_id][client_id];
 
-	if (svc->port_cnt > 0 || svc->svc_cnt > 0) {
+	if (svc->svc_cnt > 0) {
 		if (svc->port_cnt)
 			svc->port_cnt--;
-		else if (svc->svc_cnt)
-			svc->svc_cnt--;
-		if (!svc->port_cnt && !svc->svc_cnt) {
+		svc->svc_cnt--;
+		if (!svc->svc_cnt) {
 			client[dest_id][client_id].svc_cnt--;
-			svc->need_reset = 0x0;
-		}
-	} else if (client[dest_id][client_id].svc_cnt > 0) {
-		client[dest_id][client_id].svc_cnt--;
-		if (!client[dest_id][client_id].svc_cnt) {
-			svc->need_reset = 0x0;
 			pr_debug("%s: service is reset %pK\n", __func__, svc);
 		}
 	}
 
-	if (!svc->port_cnt && !svc->svc_cnt) {
+	if (!svc->svc_cnt) {
 		svc->priv = NULL;
 		svc->id = 0;
 		svc->fn = NULL;
@@ -691,6 +696,7 @@ void dispatch_event(unsigned long code, uint16_t proc)
 	uint16_t clnt;
 	int i, j;
 
+	memset(&data, 0, sizeof(data));
 	data.opcode = RESET_EVENTS;
 	data.reset_event = code;
 
@@ -783,6 +789,7 @@ static int lpass_notifier_cb(struct notifier_block *this, unsigned long code,
 {
 	static int boot_count = 2;
 	struct notif_data *data = (struct notif_data *)_cmd;
+	struct scm_desc desc;
 
 	if (boot_count) {
 		boot_count--;
@@ -796,7 +803,15 @@ static int lpass_notifier_cb(struct notifier_block *this, unsigned long code,
 		dispatch_event(code, APR_DEST_QDSP6);
 		if (data && data->crashed) {
 			/* Send NMI to QDSP6 via an SCM call. */
-			scm_call_atomic1(SCM_SVC_UTIL, SCM_Q6_NMI_CMD, 0x1);
+			if (!is_scm_armv8()) {
+				scm_call_atomic1(SCM_SVC_UTIL,
+						 SCM_Q6_NMI_CMD, 0x1);
+			} else {
+				desc.args[0] = 0x1;
+				desc.arginfo = SCM_ARGS(1);
+				scm_call2_atomic(SCM_SIP_FNID(SCM_SVC_UTIL,
+						 SCM_Q6_NMI_CMD), &desc);
+			}
 			/* The write should go through before q6 is shutdown */
 			mb();
 			pr_debug("L-Notify: Q6 NMI was sent.\n");
@@ -830,9 +845,19 @@ static struct notifier_block lnb = {
 static int panic_handler(struct notifier_block *this,
 				unsigned long event, void *ptr)
 {
-	if (powered_on)
+	struct scm_desc desc;
+
+	if (powered_on) {
 		/* Send NMI to QDSP6 via an SCM call. */
-		scm_call_atomic1(SCM_SVC_UTIL, SCM_Q6_NMI_CMD, 0x1);
+		if (!is_scm_armv8()) {
+			scm_call_atomic1(SCM_SVC_UTIL, SCM_Q6_NMI_CMD, 0x1);
+		} else {
+			desc.args[0] = 0x1;
+			desc.arginfo = SCM_ARGS(1);
+			scm_call2_atomic(SCM_SIP_FNID(SCM_SVC_UTIL,
+					 SCM_Q6_NMI_CMD), &desc);
+		}
+	}
 	return NOTIFY_DONE;
 }
 

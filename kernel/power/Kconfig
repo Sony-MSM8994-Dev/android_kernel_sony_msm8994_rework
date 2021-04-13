@@ -26,6 +26,19 @@ config WAKELOCK
 	bool
 	default y
 
+config POWERSUSPEND
+	bool "Power suspend"
+	default y
+	---help---
+	  Call early suspend handlers when the user requested sleep state
+	  changes.
+
+config POWERSUSPEND_DEBUG
+	bool "Powersuspend driver debugging code"
+	depends on POWERSUSPEND
+	help
+	  Output debugging info in dmesg [POWERSUSPEND]
+
 config HIBERNATE_CALLBACKS
 	bool
 
@@ -327,3 +340,22 @@ config WAKEUP_IRQ_DEBUG
 	---help---
 	  This enables debug information about wakeup interrupts using
 	  sysfs (/sys/kernel/).
+
+config PARTIALRESUME
+	bool "Partial-resume framework"
+	---help---
+	  Provides hooks for drivers to register partial-resume handlers.
+	  Similar to suspend_again support already in kernel, except that it
+	  operates with kernel threads unfrozen and userspace still frozen,
+	  allowing callbacks to block on work queues and kernel threads.
+	  Partial resume will occur only if all wakeup sources have
+	  partial-resume handlers associated with them, and they all return
+	  true.
+
+config QUICK_WAKEUP
+	bool "Quick wakeup"
+	depends on SUSPEND
+	default n
+	---help---
+	  Allow kernel driver to do periodic jobs without resuming the full system
+	  This option can increase battery life on android powered smartphone.

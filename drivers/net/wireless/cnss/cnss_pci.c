@@ -1364,6 +1364,9 @@ static int cnss_wlan_pci_suspend(struct device *dev)
 	if (!penv)
 		goto out;
 
+	if (!penv->pcie_link_state)
+		goto out;
+
 	wdriver = penv->driver;
 	if (!wdriver)
 		goto out;
@@ -1389,6 +1392,9 @@ static int cnss_wlan_pci_resume(struct device *dev)
 	struct pci_dev *pdev = to_pci_dev(dev);
 
 	if (!penv)
+		goto out;
+
+	if (!penv->pcie_link_state)
 		goto out;
 
 	wdriver = penv->driver;
@@ -1592,6 +1598,13 @@ void cnss_schedule_recovery_work(void)
 }
 EXPORT_SYMBOL(cnss_schedule_recovery_work);
 
+static inline void __cnss_disable_irq(void *data)
+{
+	struct pci_dev *pdev = data;
+
+	disable_irq(pdev->irq);
+}
+
 void cnss_pci_events_cb(struct msm_pcie_notify *notify)
 {
 	unsigned long flags;
@@ -1612,6 +1625,7 @@ void cnss_pci_events_cb(struct msm_pcie_notify *notify)
 		spin_unlock_irqrestore(&pci_link_down_lock, flags);
 
 		pr_err("PCI link down, schedule recovery\n");
+		__cnss_disable_irq(notify->user);
 		schedule_work(&recovery_work);
 		break;
 
